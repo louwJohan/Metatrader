@@ -1,6 +1,6 @@
 // Native MQL5. See README.md for execution and recovery semantics.
 #property strict
-#property version "1.00"
+#property version "1.10"
 #include <Trade/Trade.mqh>
 
 enum ENUM_SIZE_MODE
@@ -31,6 +31,11 @@ input double InpRiskBalancePercent=1.0;
 input double InpRiskAccountCurrency=100.0;
 input double InpFixedLots=0.10;
 
+input group "Consecutive loss pause"
+input bool InpUseLossPause=true;
+input int InpConsecutiveLossLimit=3;
+input int InpLossPauseHours=24;
+
 input group "Stops: percent of actual entry price"
 input double InpStopLossPercent=5.0;
 input double InpTakeProfitPercent=1.0;
@@ -49,6 +54,19 @@ int rsi_handle=INVALID_HANDLE,ma_handle=INVALID_HANDLE;
 int state_file=INVALID_HANDLE;
 bool testing=false,ready=false,buy_armed=true,sell_armed=true;
 datetime last_bar=0,last_manage=0;
+datetime loss_pause_until=0;
+bool loss_history_dirty=true;
+int loss_history_count=-1;
+
+struct LossPosition
+  {
+   bool owned;
+   double opened;
+   double closed;
+   double net;
+   long close_msc;
+   ulong close_ticket;
+  };
 double tick_size=0,point_size=0;
 int digits_count=0;
 ulong trail_active[];
@@ -142,9 +160,10 @@ bool LoadState()
    while(FileTell(state_file)+24<=size)
      {
       long stamp=FileReadLong(state_file),flags=FileReadLong(state_file),check=FileReadLong(state_file);
-      if(stamp<0 || flags<0 || flags>4 || check!=(stamp^flags^JOURNAL_SALT))
+      if(stamp<0 || flags<0 || flags>5 || check!=(stamp^flags^JOURNAL_SALT))
         { damaged=true; break; }
-      if(flags==4)
+      if(flags==5) loss_pause_until=(datetime)stamp;
+      else if(flags==4)
         {
          if(!ActivateTrail((ulong)stamp,false)) return false;
         }
@@ -190,6 +209,115 @@ bool Owned(const ulong ticket)
   {
    return PositionSelectByTicket(ticket) && PositionGetString(POSITION_SYMBOL)==_Symbol &&
           (ulong)PositionGetInteger(POSITION_MAGIC)==InpMagicNumber;
+  }
+
+// Rebuild from complete position lifetimes, not individual partial-close deals.
+// Called before entry; history is only aggregated when its count changes or an
+// event invalidates it. Broker history also recovers exits during terminal downtime.
+bool RefreshLossPause()
+  {
+   if(!InpUseLossPause) return true;
+   if(!HistorySelect(0,TimeCurrent())) return false; // fail closed for entries
+   int total=HistoryDealsTotal();
+   if(!loss_history_dirty && total==loss_history_count) return true;
+   ulong ids[];
+   if(ArrayResize(ids,total)!=total) return false;
+   int used=0;
+   for(int i=0;i<total;i++)
+     {
+      ulong deal=HistoryDealGetTicket(i);
+      if(deal==0) return false;
+      if(HistoryDealGetString(deal,DEAL_SYMBOL)!=_Symbol) continue;
+      ulong id=(ulong)HistoryDealGetInteger(deal,DEAL_POSITION_ID);
+      if(id>0) ids[used++]=id;
+     }
+   ArrayResize(ids,used);
+   if(used>0 && !ArraySort(ids)) return false;
+   int unique=0;
+   for(int i=0;i<used;i++)
+      if(unique==0 || ids[i]!=ids[unique-1]) ids[unique++]=ids[i];
+   ArrayResize(ids,unique);
+   LossPosition positions[];
+   if(ArrayResize(positions,unique)!=unique) return false;
+   for(int i=0;i<unique;i++) ZeroMemory(positions[i]);
+   for(int i=0;i<total;i++)
+     {
+      ulong deal=HistoryDealGetTicket(i);
+      if(deal==0) return false;
+      if(HistoryDealGetString(deal,DEAL_SYMBOL)!=_Symbol) continue;
+      ulong id=(ulong)HistoryDealGetInteger(deal,DEAL_POSITION_ID);
+      if(id==0 || unique==0) continue;
+      int p=ArrayBsearch(ids,id);
+      if(p<0 || ids[p]!=id) return false;
+      positions[p].net+=HistoryDealGetDouble(deal,DEAL_PROFIT)+
+                        HistoryDealGetDouble(deal,DEAL_COMMISSION)+
+                        HistoryDealGetDouble(deal,DEAL_SWAP)+HistoryDealGetDouble(deal,DEAL_FEE);
+      ENUM_DEAL_TYPE type=(ENUM_DEAL_TYPE)HistoryDealGetInteger(deal,DEAL_TYPE);
+      if(type!=DEAL_TYPE_BUY && type!=DEAL_TYPE_SELL) continue;
+      ENUM_DEAL_ENTRY entry=(ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal,DEAL_ENTRY);
+      double volume=HistoryDealGetDouble(deal,DEAL_VOLUME);
+      if(entry==DEAL_ENTRY_IN)
+        {
+         positions[p].opened+=volume;
+         if((ulong)HistoryDealGetInteger(deal,DEAL_MAGIC)==InpMagicNumber)
+            positions[p].owned=true;
+        }
+      else if(entry==DEAL_ENTRY_OUT || entry==DEAL_ENTRY_OUT_BY)
+        {
+         // Include manual/SL/TP exits of our position even if exit magic differs.
+         positions[p].closed+=volume;
+         long msc=HistoryDealGetInteger(deal,DEAL_TIME_MSC);
+         if(msc>positions[p].close_msc ||
+            (msc==positions[p].close_msc && deal>positions[p].close_ticket))
+           { positions[p].close_msc=msc; positions[p].close_ticket=deal; }
+        }
+     }
+   // First dimension sorts by close millisecond; explicit tie sort below.
+   long completed[][3];
+   if(ArrayResize(completed,unique)<0) return false;
+   int count=0;
+   for(int i=0;i<unique;i++)
+     {
+      if(!positions[i].owned || positions[i].opened<=0 ||
+         MathAbs(positions[i].opened-positions[i].closed)>1e-8) continue;
+      completed[count][0]=positions[i].close_msc;
+      completed[count][1]=(long)positions[i].close_ticket;
+      completed[count][2]=i;
+      count++;
+     }
+   ArrayResize(completed,count);
+   if(count>0 && !ArraySort(completed)) return false;
+   for(int i=1;i<count;i++)
+      for(int j=i;j>0 && completed[j][0]==completed[j-1][0] &&
+          completed[j][1]<completed[j-1][1];j--)
+         for(int k=0;k<3;k++)
+           { long tmp=completed[j][k]; completed[j][k]=completed[j-1][k]; completed[j-1][k]=tmp; }
+   int streak=0;
+   datetime replay_pause=0;
+   for(int i=0;i<count;i++)
+     {
+      datetime closed_at=(datetime)(completed[i][0]/1000);
+      if(closed_at<replay_pause) continue; // exits during a pause do not extend it
+      int p=(int)completed[i][2];
+      if(positions[p].net<0) streak++; else streak=0;
+      if(streak>=InpConsecutiveLossLimit)
+        {
+         replay_pause=closed_at+(long)InpLossPauseHours*3600;
+         streak=0;
+        }
+     }
+   // Never shorten a durable pause if broker history was subsequently truncated.
+   if(replay_pause>loss_pause_until)
+     {
+      loss_pause_until=replay_pause;
+      if(!SaveRecord((long)loss_pause_until,5)) return false;
+      if(TimeCurrent()<loss_pause_until)
+         Print("Consecutive loss limit reached. New entries paused until ",
+               TimeToString(loss_pause_until,TIME_DATE|TIME_SECONDS)," (server time).");
+     }
+   loss_history_count=total;
+   loss_history_dirty=false;
+   return true;
   }
 
 double RoundPrice(const double price,const bool upward)
@@ -295,6 +423,7 @@ bool FillingPolicy(ENUM_ORDER_TYPE_FILLING &filling)
 void Enter(const bool buy,const double ma)
   {
    if(!ready || !CanTrade() || PendingOwnOrder()) return;
+   if(!RefreshLossPause() || (InpUseLossPause && TimeCurrent()<loss_pause_until)) return;
    int count=0;
    for(int i=0;i<PositionsTotal();i++) if(Owned(PositionGetTicket(i))) count++;
    if(InpMaxOwnPositions>0 && count>=InpMaxOwnPositions) return;
@@ -449,6 +578,7 @@ int OnInit()
       InpTrailTriggerPercent<0 || InpTrailDistancePercent<0 || InpTrailStepPercent<0 ||
       (InpUseTrailingStop && InpTrailDistancePercent<=0) ||
       InpMaxSpreadPoints<0 || InpMaxOwnPositions<0 ||
+      InpConsecutiveLossLimit<1 || InpLossPauseHours<1 || InpLossPauseHours>87600 ||
       (InpSizeMode==SIZE_FIXED_LOTS && InpFixedLots<=0) ||
       (InpSizeMode!=SIZE_FIXED_LOTS && InpStopLossPercent<=0) ||
       (InpSizeMode==SIZE_BALANCE_PERCENT && (InpRiskBalancePercent<=0 || InpRiskBalancePercent>100)) ||
@@ -472,6 +602,8 @@ int OnInit()
    if(!LoadState()) return INIT_FAILED;
    ready=true;
    if(!SaveState()) return INIT_FAILED;
+   // If history is temporarily unavailable, Enter retries and blocks new trades.
+   RefreshLossPause();
    return INIT_SUCCEEDED;
   }
 
@@ -486,10 +618,15 @@ void OnTick()
 void OnTradeTransaction(const MqlTradeTransaction &transaction,
                         const MqlTradeRequest &request,const MqlTradeResult &result)
   {
+   if(transaction.type==TRADE_TRANSACTION_DEAL_ADD ||
+      transaction.type==TRADE_TRANSACTION_DEAL_UPDATE ||
+      transaction.type==TRADE_TRANSACTION_DEAL_DELETE)
+      loss_history_dirty=true;
    if(transaction.type==TRADE_TRANSACTION_DEAL_ADD && transaction.symbol==_Symbol)
      {
       // Includes late/partial executions; ownership is checked per position.
       ManagePositions();
+      RefreshLossPause();
      }
   }
 

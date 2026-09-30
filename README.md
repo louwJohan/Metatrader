@@ -24,7 +24,19 @@ For a buy at 100, initial SL=95 and TP=101. At Bid=100.50 the trail can set SL=1
 
 Position management runs on the first tick of each server second and after deal events. It does not run while MT5 is stopped/disconnected; SL/TP already accepted by the broker remain server-side. No historical trailing high/low is fabricated after downtime.
 
-## Sizing
+## Consecutive-loss pause (v1.10)
+
+Enabled by default: after **3 consecutive losing fully closed positions**, new entries pause for **24 hours** from the third position's final closing time. Inputs are `InpUseLossPause`, `InpConsecutiveLossLimit` (3), and `InpLossPauseHours` (24). The pause applies to both buy and sell entries for this symbol/magic only. Existing positions retain SL/TP and trailing management. Normal new-bar entries resume automatically after expiry, subject to the usual RSI rearm and filters.
+
+A trade's result includes its entry/exit profit, commission, swap and fees attached to its position identifier. Partial exits are combined and counted only when all opening volume has closed. A net profitable or exactly break-even position resets the losing streak. Manual closure of an EA-owned position also counts. Unattributed account-level charges cannot be assigned to a trade and are excluded. Trades are ordered by final closing millisecond, then closing deal ticket.
+
+The streak resets when a pause starts. Existing positions closing during the pause neither extend nor cancel it; counting starts afresh for closes at or after expiry. The pause uses broker server time and elapsed hours, including weekends. Changing settings reconstructs history with the new settings but never shortens an already saved pause; explicitly disabling the feature bypasses it.
+
+The expiry is flushed to the existing journal (record type 5). The streak and missed closures are reconstructed from available broker history on startup and before entries when history changes. Existing historical trades are included when first upgrading. If history selection fails, entries are blocked and retried later. Retain complete broker history: missing older deals can prevent reconstructing the pre-pause streak, although a saved active pause is preserved. Version 1.10 reads existing v1 journals; older EA versions cannot read a journal once it contains pause records.
+
+Validation: native MetaEditor compilation remains unavailable. Acceptance checks: three losses pause entry; a win/break-even between losses resets the count; partial exits count once; unrelated symbols/magic numbers have no effect; restart halfway through the pause preserves its original expiry; expiry permits the next eligible new-bar entry; SL/TP/trailing keep working during the pause. Test closes during the pause and commission turning a gross profit into a net loss.
+
+## Sizing modes
 
 | Mode | Input | Behavior |
 |---|---|---|
